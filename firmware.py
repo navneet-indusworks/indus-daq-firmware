@@ -3,6 +3,7 @@
 # ========================
 from machine import Timer, Pin, WDT, reset, disable_irq, enable_irq
 from time import sleep
+import time
 import json
 import emonlib_esp32 as emonlib
 import wifimgr
@@ -116,6 +117,15 @@ def get_configuration():
         return None
 
 
+def handle_telemetry():
+    #collate_counters()
+    send_telemetry()
+
+def collate_counters():
+    global accumulated_output_counter, pending_output_counter
+    global accumulated_rejection_counter, pending_rejection_counter
+    pending_output_counter, pending_rejection_counter, accumulated_output_counter, accumulated_rejection_counter = accumulated_output_counter, accumulated_rejection_counter, 0, 0
+
 def send_telemetry():
     """Send telemetry to server and track failure count."""
     global site, device_id, api_key, api_secret
@@ -124,18 +134,9 @@ def send_telemetry():
     global accumulated_rejection_counter, pending_rejection_counter
     global telemetry_failures
     global wlan
-
-    state = disable_irq()
+    
     try:
-        pending_output_counter = accumulated_output_counter
-        accumulated_output_counter = 0
-        pending_rejection_counter = accumulated_rejection_counter
-        accumulated_rejection_counter = 0
-    finally:
-        enable_irq(state)
-
-    try:
-        url = f'https://{site}/api/v2/method/indusworks_mes.api.create_telemetry?device_id={device_id}&current={current}&output_signal_count={pending_output_counter}&rejection_signal_count={pending_rejection_counter}'
+        url = f'https://{site}/api/v2/method/indusworks_mes.api.create_telemetry?device_id={device_id}&current={current}&output_signal_count={accumulated_output_counter}&rejection_signal_count={accumulated_rejection_counter}'
         headers = {'Authorization': f'token {api_key}:{api_secret}'}
         response = requests.post(url, headers=headers)
         
@@ -159,12 +160,8 @@ def send_telemetry():
             print("No WiFi connection, caching telemetry data")
 
     # On failure, restore counts and increment failure count
-    state = disable_irq()
-    try:
-        accumulated_output_counter += pending_output_counter
-        accumulated_rejection_counter += pending_rejection_counter
-    finally:
-        enable_irq(state)
+    accumulated_output_counter += pending_output_counter
+    accumulated_rejection_counter += pending_rejection_counter
     telemetry_failures += 1
     return check_telemetry_failure_limit()
 
@@ -224,6 +221,7 @@ def run():
             output_pulses = PCNT(0, pin=output_pin, rising=rising_action, falling=falling_action, maximum=output_signal_threshold)
             output_pulses.irq(handler=update_output_counter, trigger=PCNT.IRQ_MAXIMUM)
             output_pulses.start()
+            
 
         # Setup rejection signal pulse counting
         enable_rejection_signal = bool(configuration["data"]["enable_rejection_signal"])
@@ -244,7 +242,7 @@ def run():
         # Setup telemetry timer
         telemetry_logging_frequency = int(configuration["data"]["telemetry_logging_frequency"])
         send_telemetry_signal = Timer(1)
-        send_telemetry_signal.init(period=telemetry_logging_frequency * 1000,mode=Timer.PERIODIC,callback=lambda t: send_telemetry())
+        send_telemetry_signal.init(period=telemetry_logging_frequency * 1000,mode=Timer.PERIODIC,callback=lambda t: handle_telemetry())
 
         # Boot diagnostics
         print(f"System initialized:")
