@@ -3,7 +3,6 @@
 # ========================
 from machine import Timer, Pin, WDT, reset, disable_irq, enable_irq
 from time import sleep
-import time
 import json
 import emonlib_esp32 as emonlib
 import wifimgr
@@ -39,18 +38,17 @@ telemetry_logging_frequency = 60 # Default is 60 seconds
 telemetry_failures = 0  # Tracks how many times telemetry has failed in a row
 
 enable_state_logging = True
+ct = None
 current = 0.00
 
-output_pulses = 0
-accumulated_output_counter = 0
-pending_output_counter = 0
-output_signal_threshold = 0
+output_pulse_counter_function  = None
+accumulated_output_pulses = 0
+accumulated_unsent_output = 0
 output_signal_type = 'NPN'
 
-rejection_pulses = 0
-accumulated_rejection_counter = 0
-pending_rejection_counter = 0
-rejection_signal_threshold = 0
+rejection_pulses_counter_function = None
+accumulated_rejection_pulses = 0
+accumulated_unsent_rejection = 0
 rejection_signal_type = 'NPN'
 
 wlan = None
@@ -88,13 +86,10 @@ def check_telemetry_failure_limit():
         reset()
     return False
 
-def update_output_counter(arg):
-    global accumulated_output_counter
-    accumulated_output_counter += 1
+def measure_current():
+    global current, ct
+    current = ct.calc_current_rms(1480)
 
-def update_rejection_counter(arg):
-    global accumulated_rejection_counter
-    accumulated_rejection_counter += 1
 
 # ========================
 # API Functions
@@ -116,52 +111,62 @@ def get_configuration():
         print("Error Getting Configuration: ", e)
         return None
 
-
-def handle_telemetry():
-    #collate_counters()
-    send_telemetry()
-
-def collate_counters():
-    global accumulated_output_counter, pending_output_counter
-    global accumulated_rejection_counter, pending_rejection_counter
-    pending_output_counter, pending_rejection_counter, accumulated_output_counter, accumulated_rejection_counter = accumulated_output_counter, accumulated_rejection_counter, 0, 0
-
 def send_telemetry():
     """Send telemetry to server and track failure count."""
     global site, device_id, api_key, api_secret
     global current
-    global accumulated_output_counter, pending_output_counter
-    global accumulated_rejection_counter, pending_rejection_counter
+    global output_pulse_counter_function, accumulated_unsent_output
+    global rejection_pulses_counter_function, accumulated_unsent_rejection
     global telemetry_failures
     global wlan
-    
+
+    # Read current pulse values and store them safely
+    state = disable_irq()
     try:
-        url = f'https://{site}/api/v2/method/indusworks_mes.api.create_telemetry?device_id={device_id}&current={current}&output_signal_count={accumulated_output_counter}&rejection_signal_count={accumulated_rejection_counter}'
+        current_output_count = output_pulse_counter_function.value(0) if output_pulse_counter_function else 0
+        current_rejection_count = rejection_pulses_counter_function.value(0) if rejection_pulses_counter_function else 0
+        
+        # Add current counts to any previously unsent counts
+        total_output_to_send = current_output_count + accumulated_unsent_output
+        total_rejection_to_send = current_rejection_count + accumulated_unsent_rejection
+    finally:
+        enable_irq(state)
+
+    try:
+        url = f'https://{site}/api/v2/method/indusworks_mes.api.create_telemetry?device_id={device_id}&current={current}&output_signal_count={total_output_to_send}&rejection_signal_count={total_rejection_to_send}'
         headers = {'Authorization': f'token {api_key}:{api_secret}'}
         response = requests.post(url, headers=headers)
         
         if response.status_code == 200:
-            print(f"Telemetry sent successfully: Output={pending_output_counter}, Rejection={pending_rejection_counter}")
+            print(f"Telemetry sent successfully: Output={total_output_to_send}, Rejection={total_rejection_to_send}")
+            # Clear the unsent accumulation on success
+            accumulated_unsent_output = 0
+            accumulated_unsent_rejection = 0
             telemetry_failures = 0
             return True
         else:
-            print('[!] create_telemetry: response not received')
-            # Only check wifi if request fails with a status code issue
+            print(f'[!] create_telemetry: response error {response.status_code}')
+            # Save the counts that weren't sent successfully
+            accumulated_unsent_output = total_output_to_send
+            accumulated_unsent_rejection = total_rejection_to_send
+            
+            # Check wifi connection if request fails
             if not wlan.isconnected():
                 check_wifi_connection()
     except Exception as e:
         import sys
         print("Error Sending Telemetry:")
         sys.print_exception(e)
-        print("Exception:", e)
+        
+        # Save the counts that weren't sent successfully
+        accumulated_unsent_output = total_output_to_send
+        accumulated_unsent_rejection = total_rejection_to_send
         
         # This handles network connectivity issues
         if not check_wifi_connection():
             print("No WiFi connection, caching telemetry data")
 
-    # On failure, restore counts and increment failure count
-    accumulated_output_counter += pending_output_counter
-    accumulated_rejection_counter += pending_rejection_counter
+    # Increment failure count
     telemetry_failures += 1
     return check_telemetry_failure_limit()
 
@@ -169,11 +174,9 @@ def send_telemetry():
 def run():
     global site, device_id, api_key, api_secret
     global telemetry_logging_frequency
-    global enable_state_logging, current
-    global output_pulses, output_signal_threshold, output_signal_type
-    global accumulated_output_counter, pending_output_counter
-    global rejection_pulses, rejection_signal_threshold, rejection_signal_type
-    global accumulated_rejection_counter, pending_rejection_counter
+    global enable_state_logging, current, ct
+    global output_pulse_counter_function, output_signal_type
+    global rejection_pulses_counter_function, rejection_signal_type
     global wlan
 
     try:
@@ -205,11 +208,12 @@ def run():
             for _ in range(10):
                 current = ct.calc_current_rms(1480)
                 print(f'Dummy Value: {current}')
+            measure_current_timer = Timer(2)
+            measure_current_timer.init(period=1000,mode=Timer.PERIODIC,callback=lambda t: measure_current())
 
         # Setup output signal pulse counting
         enable_output_signal = bool(configuration["data"]["enable_output_signal"])
         if enable_output_signal:
-            output_signal_threshold = int(configuration["data"]["output_signal_threshold"])
             output_signal_type = str(configuration["data"]["output_signal_type"])
             output_pin = Pin(OUTPUT_SIGNAL_PIN, Pin.IN, Pin.PULL_UP)
             if output_signal_type == 'NPN':
@@ -218,15 +222,12 @@ def run():
             elif output_signal_type == 'PNP':
                 rising_action = PCNT.INCREMENT
                 falling_action = PCNT.IGNORE
-            output_pulses = PCNT(0, pin=output_pin, rising=rising_action, falling=falling_action, maximum=output_signal_threshold)
-            output_pulses.irq(handler=update_output_counter, trigger=PCNT.IRQ_MAXIMUM)
-            output_pulses.start()
-            
+            output_pulse_counter_function = PCNT(0, pin=output_pin, rising=rising_action, falling=falling_action)
+            output_pulse_counter_function.start()
 
         # Setup rejection signal pulse counting
         enable_rejection_signal = bool(configuration["data"]["enable_rejection_signal"])
         if enable_rejection_signal:
-            rejection_signal_threshold = int(configuration["data"]["rejection_signal_threshold"])
             rejection_signal_type = str(configuration["data"]["rejection_signal_type"])
             rejection_pin = Pin(REJECTION_SIGNAL_PIN, Pin.IN, Pin.PULL_UP)
             if rejection_signal_type == 'NPN':
@@ -235,28 +236,28 @@ def run():
             elif rejection_signal_type == 'PNP':
                 rising_action = PCNT.INCREMENT
                 falling_action = PCNT.IGNORE
-            rejection_pulses = PCNT(1, pin=rejection_pin, rising=rising_action, falling=falling_action, maximum=rejection_signal_threshold)
-            rejection_pulses.irq(handler=update_rejection_counter, trigger=PCNT.IRQ_MAXIMUM)
-            rejection_pulses.start()
+            rejection_pulses_counter_function = PCNT(1, pin=rejection_pin, rising=rising_action, falling=falling_action)
+            rejection_pulses_counter_function.start()
         
         # Setup telemetry timer
         telemetry_logging_frequency = int(configuration["data"]["telemetry_logging_frequency"])
         send_telemetry_signal = Timer(1)
-        send_telemetry_signal.init(period=telemetry_logging_frequency * 1000,mode=Timer.PERIODIC,callback=lambda t: handle_telemetry())
+        send_telemetry_signal.init(period=telemetry_logging_frequency * 1000,mode=Timer.PERIODIC,callback=lambda t: send_telemetry())
 
         # Boot diagnostics
         print(f"System initialized:")
         print(f"- Telemetry frequency: {telemetry_logging_frequency} seconds")
-        print(f"- Output signal enabled: {enable_output_signal}, threshold: {output_signal_threshold}")
-        print(f"- Rejection signal enabled: {enable_rejection_signal}, threshold: {rejection_signal_threshold}")
+        print(f"- Output signal enabled: {enable_output_signal}")
+        print(f"- Rejection signal enabled: {enable_rejection_signal}")
         print(f"- State monitoring enabled: {enable_state_logging}")
 
         # Main loop
         while True:
             wdt.feed()
-            if enable_state_logging:
-                current = ct.calc_current_rms(1480)
-            print(f"Current: {current}, Output Counter: {accumulated_output_counter}, Rejection Counter: {accumulated_rejection_counter}")
+            current_output_pulses = output_pulse_counter_function.value() if output_pulse_counter_function else 0
+            current_rejection_pulses = rejection_pulses_counter_function.value() if rejection_pulses_counter_function else 0
+            print(f"Macine Current: {current}, Output Pulses Recieved: {current_output_pulses}, Rejection Pulses Recieved: {current_rejection_pulses}")
+
 
     except Exception as e:
         print("Error Running The Main Function: ", e)
