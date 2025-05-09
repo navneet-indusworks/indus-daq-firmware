@@ -133,7 +133,7 @@ def send_telemetry():
         enable_irq(state)
 
     try:
-        url = f'https://{site}/api/v2/method/indusworks_mes.api.create_telemetry?device_id={device_id}&current={current}&output_signal_count={total_output_to_send}&rejection_signal_count={total_rejection_to_send}'
+        url = f'https://{site}/api/v2/method/indusworks_mes.api.create_telemetry?device_id={device_id}&current={current}&cycle_completion_pulses={total_output_to_send}&rejection_pulses={total_rejection_to_send}'
         headers = {'Authorization': f'token {api_key}:{api_secret}'}
         response = requests.post(url, headers=headers)
         
